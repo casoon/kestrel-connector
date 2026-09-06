@@ -12,9 +12,9 @@ into the core library.
 
 | Feature | Module | Status |
 |---|---|---|
-| `eodhd` | `eodhd` | scaffold only, not implemented |
-| `capitalcom` | `capitalcom` | scaffold only, not implemented |
-| `ib` | `ib` | scaffold only, not implemented |
+| `eodhd` | `eodhd` | implemented (EOD, intraday, delayed real-time poll) |
+| `capitalcom` | `capitalcom` | implemented (session login, historical prices w/ pagination, latest-bar poll) |
+| `ib` | `ib` | scaffold only, not implemented (deferred — needs a running TWS/Gateway process, see plan/status.md) |
 
 ## Usage
 
