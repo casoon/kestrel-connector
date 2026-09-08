@@ -21,4 +21,7 @@ mockito = "1"
 default = []
 eodhd = ["dep:ureq", "dep:serde"]
 capitalcom = ["dep:ureq", "dep:serde"]
+# Massive (vormals Polygon.io) — Boersenvolumen aus Futures. Eigenes Flag,
+# damit ein Nutzer ohne Futures-Abo nichts davon mitzieht.
+massive = ["dep:ureq", "dep:serde"]
 ib = []

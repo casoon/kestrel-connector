@@ -4,7 +4,7 @@
 //! `kestrel-chartkit` itself stays vendor-neutral; this crate is where the provider-specific
 //! HTTP/auth/session details live instead. See the crate README for scope and status.
 
-#[cfg(any(feature = "eodhd", feature = "capitalcom"))]
+#[cfg(any(feature = "eodhd", feature = "capitalcom", feature = "massive"))]
 mod civil_date;
 
 #[cfg(feature = "eodhd")]
@@ -12,6 +12,9 @@ pub mod eodhd;
 
 #[cfg(feature = "capitalcom")]
 pub mod capitalcom;
+
+#[cfg(feature = "massive")]
+pub mod massive;
 
 #[cfg(feature = "ib")]
 pub mod ib;

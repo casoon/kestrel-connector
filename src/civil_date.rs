@@ -23,6 +23,13 @@ pub(crate) fn civil_from_days(days: i64) -> (i32, u32, u32) {
     )
 }
 
+// Nur `capitalcom` und `eodhd` rechnen in diese Richtung; `massive` liefert
+// bereits Zeitstempel und braucht nur den Rückweg. Ohne das Attribut warnt
+// ein Build mit `--features massive` allein über toten Code.
+#[cfg_attr(
+    not(any(feature = "capitalcom", feature = "eodhd")),
+    allow(dead_code)
+)]
 pub(crate) fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let adjusted_year = i64::from(year) - i64::from(month <= 2);
     let era = adjusted_year.div_euclid(400);
