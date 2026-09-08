@@ -63,12 +63,26 @@ impl EodhdAdapter {
 
         bars.into_iter()
             .map(|b| {
+                // EODHD liefert nur `adjusted_close` bereinigt, OHLC bleibt roh.
+                // Ohne Skalierung erscheint ein Split als echter Kurssturz —
+                // Amazons 20:1 im Juni 2022 als -95 % an einem Tag. Der Faktor
+                // ist fuer jede Zeile derselbe wie fuer ihren Schluss, also
+                // traegt er auch Open/High/Low.
+                let factor = if b.close > 0.0 {
+                    b.adjusted_close / b.close
+                } else {
+                    1.0
+                };
                 Ok(Bar {
                     timestamp: parse_eod_date(&b.date)?,
-                    open: b.open,
-                    high: b.high,
-                    low: b.low,
-                    close: b.close,
+                    open: b.open * factor,
+                    high: b.high * factor,
+                    low: b.low * factor,
+                    // `b.close * factor` statt `b.adjusted_close` direkt: rechnerisch
+                    // dasselbe, aber dieselbe Operation wie fuer OHLC. Sonst faellt
+                    // ein Schluss, der im Rohkurs exakt auf dem Tief liegt, um ein
+                    // ULP darunter — und die Bar widerspraeche sich selbst.
+                    close: b.close * factor,
                     volume: b.volume,
                 })
             })
@@ -205,6 +219,7 @@ struct EodBar {
     high: f64,
     low: f64,
     close: f64,
+    adjusted_close: f64,
     volume: f64,
 }
 
@@ -284,8 +299,40 @@ mod tests {
 
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].timestamp, days_from_civil(2024, 1, 2) * 86_400);
-        assert_eq!(bars[0].close, 297.04);
+        // Bereinigt, nicht roh: `close` ist `adjusted_close`, und OHLC traegt
+        // denselben Faktor, sonst waere die Bar in sich widerspruechlich.
+        assert_eq!(bars[0].close, 279.9221);
+        let factor = 279.9221 / 297.04;
+        assert!((bars[0].open - 295.05 * factor).abs() < 1e-9);
+        assert!((bars[0].high - 297.28 * factor).abs() < 1e-9);
+        assert!((bars[0].low - 295.05 * factor).abs() < 1e-9);
+        assert!(bars[0].low <= bars[0].close && bars[0].close <= bars[0].high);
         assert_eq!(bars[0].volume, 4_458_400.0);
+    }
+
+    /// Ein Split darf keine Kursluecke erzeugen: vor und nach Amazons 20:1
+    /// im Juni 2022 muessen die bereinigten Schlusskurse stetig sein.
+    #[test]
+    fn split_does_not_produce_a_price_gap() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/api/eod/AMZN.US")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"date":"2022-06-03","open":2450.0,"high":2460.0,"low":2440.0,"close":2447.0,"adjusted_close":122.35,"volume":1.0},
+                    {"date":"2022-06-06","open":125.0,"high":126.0,"low":124.0,"close":124.79,"adjusted_close":124.79,"volume":2.0}]"#,
+            )
+            .create();
+
+        let mut adapter = EodhdAdapter::with_base_url("token", server.url());
+        let bars = adapter
+            .fetch_historical("AMZN.US", Timeframe::Day(1), 0, 2_000_000_000)
+            .unwrap();
+
+        let jump = (bars[1].close - bars[0].close).abs() / bars[0].close;
+        assert!(jump < 0.05, "Split als Kurssprung durchgeschlagen: {jump}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "kestrel-connector"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Provider-specific DataFeedAdapter implementations (EODHD, Capital.com, Interactive Brokers) for kestrel-chartkit, one feature-gated module per provider."
 license = "BUSL-1.1"
