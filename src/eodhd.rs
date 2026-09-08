@@ -119,7 +119,13 @@ impl EodhdAdapter {
                 high: b.high,
                 low: b.low,
                 close: b.close,
-                volume: b.volume,
+                // `null` wird zu `0.0`, und das ist bewusst die schlechtere
+                // von zwei schlechten Möglichkeiten: die Bar zu verwerfen
+                // nähme auch ihren Preis mit, und der ist da. Wer aus so
+                // einer Reihe auf "führt Volumen" schließt, muss deshalb die
+                // Mehrheit der Bars ansehen, nicht das Vorhandensein der
+                // Spalte.
+                volume: b.volume.unwrap_or(0.0),
             })
             .collect())
     }
@@ -230,7 +236,12 @@ struct IntradayBar {
     high: f64,
     low: f64,
     close: f64,
-    volume: f64,
+    /// EODHD liefert auf dem Intraday-Endpunkt `null`, wo keine Menge
+    /// vorliegt — bei Randbars einer Sitzung regelmäßig. Als `f64`
+    /// deklariert ließ das die **ganze Serie** am Deserialisieren scheitern:
+    /// ein fehlendes Feld in einer von tausend Bars, und der Abruf gibt
+    /// einen Parserfehler statt Daten.
+    volume: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -344,7 +355,8 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"[{"timestamp":1700058600,"gmtoffset":0,"datetime":"2023-11-15 14:30:00","open":187.845001,"high":188.699996,"low":187.800003,"close":188.149993,"volume":11861855}]"#,
+                r#"[{"timestamp":1700058600,"gmtoffset":0,"datetime":"2023-11-15 14:30:00","open":187.845001,"high":188.699996,"low":187.800003,"close":188.149993,"volume":11861855},
+                    {"timestamp":1700062200,"gmtoffset":0,"datetime":"2023-11-15 15:30:00","open":188.1,"high":188.4,"low":188.0,"close":188.2,"volume":null}]"#,
             )
             .create();
 
@@ -353,9 +365,14 @@ mod tests {
             .fetch_historical("AAPL.US", Timeframe::Hour(1), 0, 2_000_000_000)
             .unwrap();
 
-        assert_eq!(bars.len(), 1);
+        // Zwei Bars, obwohl die zweite `volume: null` trägt: eine fehlende
+        // Menge darf nicht die ganze Serie am Deserialisieren scheitern
+        // lassen — genau das tat sie, bevor das Feld `Option` wurde.
+        assert_eq!(bars.len(), 2);
         assert_eq!(bars[0].timestamp, 1_700_058_600);
         assert_eq!(bars[0].volume, 11_861_855.0);
+        assert_eq!(bars[1].volume, 0.0);
+        assert_eq!(bars[1].close, 188.2);
     }
 
     #[test]
