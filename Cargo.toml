@@ -1,6 +1,6 @@
 [package]
 name = "kestrel-connector"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Provider-specific DataFeedAdapter implementations (EODHD, Capital.com, Interactive Brokers) for kestrel-chartkit, one feature-gated module per provider."
 license = "BUSL-1.1"
@@ -10,7 +10,7 @@ categories = ["finance"]
 readme = "README.md"
 
 [dependencies]
-kestrel-chartkit = { git = "https://github.com/casoon/kestrel-chartkit.git", tag = "v0.12.0" }
+kestrel-chartkit = { git = "https://github.com/casoon/kestrel-chartkit.git", tag = "v0.12.1" }
 ureq = { version = "3", features = ["json"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 
