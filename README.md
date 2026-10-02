@@ -21,13 +21,13 @@ into the core library.
 
 ```toml
 [dependencies]
-kestrel-connector = { git = "https://github.com/casoon/kestrel-connector.git", tag = "v0.6.1", features = ["eodhd"] }
+kestrel-connector = { git = "https://github.com/casoon/kestrel-connector.git", tag = "v0.6.2", features = ["eodhd"] }
 ```
 
 Pin the tag. Without one the dependency follows the default branch, and this crate re-exports
 `kestrel-chartkit` types — a moving `Bar` on one side of a build is how two incompatible versions
 of the same type end up in one dependency graph. Every consumer in the family must resolve to the
-same `kestrel-chartkit` version this crate pins (`v0.17.0`).
+same `kestrel-chartkit` version this crate pins (`v0.17.1`).
 
 ## Scope
 
