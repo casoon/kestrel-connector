@@ -172,7 +172,8 @@ impl MassiveAdapter {
         // Nach der ersten Seite mit Einzelkontrakten aufzuhören (wie
         // `list_outrights`) ergäbe hier Januar/Februar statt der vordersten
         // Fälligkeiten.
-        let mut vertraege = self.list_outrights_pages(product, &format_date(now), TERMINKURVE_SEITEN)?;
+        let mut vertraege =
+            self.list_outrights_pages(product, &format_date(now), TERMINKURVE_SEITEN)?;
         vertraege.sort_by(|a, b| a.last_trade_date.cmp(&b.last_trade_date));
         vertraege.truncate(n);
         let mut out = Vec::with_capacity(vertraege.len());
