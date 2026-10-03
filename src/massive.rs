@@ -59,6 +59,10 @@ const CONTRACT_PAGE_LIMIT: usize = 250;
 /// ersten beiden voller Spreads; drei Seiten sind Reserve, keine Erwartung.
 const MAX_CONTRACT_PAGES: usize = 4;
 
+/// So viele Seiten liest die Terminkurve höchstens — bei Erdgas reichen
+/// Einzelkontrakte über Jahre, verteilt über mehrere Seiten.
+const TERMINKURVE_SEITEN: usize = 12;
+
 /// Wie viele der nächstfälligen Kontrakte auf Volumen geprüft werden. Der
 /// liquideste liegt immer unter den vordersten; alles dahinter kostete nur
 /// Abrufe.
@@ -164,7 +168,11 @@ impl MassiveAdapter {
         now: i64,
         n: usize,
     ) -> Result<Vec<TerminKontrakt>, String> {
-        let mut vertraege = self.list_outrights(product, &format_date(now))?;
+        // Alle Seiten: die Liste ist alphabetisch, `NGF27` steht vor `NGX26`.
+        // Nach der ersten Seite mit Einzelkontrakten aufzuhören (wie
+        // `list_outrights`) ergäbe hier Januar/Februar statt der vordersten
+        // Fälligkeiten.
+        let mut vertraege = self.list_outrights_pages(product, &format_date(now), TERMINKURVE_SEITEN)?;
         vertraege.sort_by(|a, b| a.last_trade_date.cmp(&b.last_trade_date));
         vertraege.truncate(n);
         let mut out = Vec::with_capacity(vertraege.len());
@@ -192,9 +200,21 @@ impl MassiveAdapter {
     /// nur die erste Seite liest, bekommt eine leere Auswahl und hält sie
     /// für "gibt es nicht".
     fn list_outrights(&self, product: &str, day: &str) -> Result<Vec<ContractRow>, String> {
+        self.list_outrights_pages(product, day, 0)
+    }
+
+    /// Wie [`Self::list_outrights`]; mit `min_seiten > 0` blättert es
+    /// mindestens so viele Seiten (bis zum Ende der Liste), statt nach den
+    /// ersten Einzelkontrakten aufzuhören.
+    fn list_outrights_pages(
+        &self,
+        product: &str,
+        day: &str,
+        min_seiten: usize,
+    ) -> Result<Vec<ContractRow>, String> {
         let mut out: Vec<ContractRow> = Vec::new();
         let mut next: Option<String> = None;
-        for _ in 0..MAX_CONTRACT_PAGES {
+        for seite in 0..MAX_CONTRACT_PAGES.max(min_seiten) {
             let listing: ContractListing = match &next {
                 None => ureq::get(&format!("{}/futures/v1/contracts", self.base_url))
                     .query("product_code", product)
@@ -218,7 +238,7 @@ impl MassiveAdapter {
             );
             // Weiterblättern, bis Einzelkontrakte da sind — danach nicht mehr:
             // die restlichen Seiten tragen nur fernere Fälligkeiten.
-            if !out.is_empty() || empty {
+            if empty || (!out.is_empty() && seite + 1 >= min_seiten) {
                 break;
             }
             match listing.next_url {
@@ -476,8 +496,9 @@ mod tests {
         assert_eq!(adapter.front_month("NG", 1_788_652_800).unwrap(), "NGX26");
     }
 
-    /// Die Terminkurve ordnet nach Verfall und trägt je Kontrakt den
-    /// jüngsten Schluss.
+    /// Die Terminkurve liest alle Seiten (die Liste ist alphabetisch, `NGF27`
+    /// vor `NGX26`), ordnet nach Verfall und trägt je Kontrakt den jüngsten
+    /// Schluss.
     #[test]
     fn terminkurve_nach_verfall_mit_schluss() {
         let mut server = mockito::Server::new();
@@ -485,9 +506,20 @@ mod tests {
             .mock("GET", "/futures/v1/contracts")
             .match_query(mockito::Matcher::Any)
             .with_status(200)
+            .with_body(format!(
+                r#"{{"results":[
+                {{"ticker":"NGF7-NGF8","active":true}},
+                {{"ticker":"NGF27","active":true,"last_trade_date":"2026-12-29"}}
+            ],"next_url":"{}/seite2"}}"#,
+                server.url()
+            ))
+            .create();
+        let _seite2 = server
+            .mock("GET", "/seite2")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
             .with_body(
                 r#"{"results":[
-                {"ticker":"NGF7-NGF8","active":true},
                 {"ticker":"NGZ26","active":true,"last_trade_date":"2026-11-25"},
                 {"ticker":"NGX26","active":true,"last_trade_date":"2026-10-28"}
             ]}"#,
