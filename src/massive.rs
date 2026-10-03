@@ -64,6 +64,15 @@ const MAX_CONTRACT_PAGES: usize = 4;
 /// Abrufe.
 const FRONT_MONTH_CANDIDATES: usize = 4;
 
+/// Ein Kontrakt der Terminkurve: Ticker, letzter Handelstag
+/// (`YYYY-MM-DD`) und jüngster Tagesschluss.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminKontrakt {
+    pub ticker: String,
+    pub last_trade_date: String,
+    pub close: Option<f64>,
+}
+
 /// [`DataFeedAdapter`] für Massives Futures-Endpunkte. Braucht einen Schlüssel
 /// mit **Futures**-Berechtigung — Massive rechnet je Anlageklasse ab, ein
 /// Aktien-Abo schaltet diese Endpunkte nicht frei.
@@ -142,6 +151,37 @@ impl MassiveAdapter {
         self.front_month
             .insert(product.to_string(), (ticker.clone(), now));
         Ok(ticker)
+    }
+
+    /// Die vordersten `n` aktiven Einzelkontrakte eines Produkts nach
+    /// Verfall, je mit jüngstem Tagesschluss — die Terminkurve, aus der ein
+    /// Spot-CFD seine tägliche Prämienanpassung ableitet (Kestrel plan/65).
+    /// Ein Kontrakt ohne Tagesbar trägt `close: None`, statt die Kurve zu
+    /// verwerfen.
+    pub fn terminkurve(
+        &self,
+        product: &str,
+        now: i64,
+        n: usize,
+    ) -> Result<Vec<TerminKontrakt>, String> {
+        let mut vertraege = self.list_outrights(product, &format_date(now))?;
+        vertraege.sort_by(|a, b| a.last_trade_date.cmp(&b.last_trade_date));
+        vertraege.truncate(n);
+        let mut out = Vec::with_capacity(vertraege.len());
+        for v in vertraege {
+            // Zehn Tage zurück: über ein Wochenende mit Feiertag reicht ein
+            // kürzeres Fenster nicht.
+            let close = self
+                .fetch_aggs(&v.ticker, "1day", Some(now - 10 * 86_400), None, 20)
+                .ok()
+                .and_then(|bars| bars.last().map(|b| b.close));
+            out.push(TerminKontrakt {
+                ticker: v.ticker,
+                last_trade_date: v.last_trade_date,
+                close,
+            });
+        }
+        Ok(out)
     }
 
     /// Alle aktiven Einzelkontrakte eines Produkts an einem Tag.
@@ -434,6 +474,47 @@ mod tests {
 
         let mut adapter = MassiveAdapter::with_base_url("token", server.url());
         assert_eq!(adapter.front_month("NG", 1_788_652_800).unwrap(), "NGX26");
+    }
+
+    /// Die Terminkurve ordnet nach Verfall und trägt je Kontrakt den
+    /// jüngsten Schluss.
+    #[test]
+    fn terminkurve_nach_verfall_mit_schluss() {
+        let mut server = mockito::Server::new();
+        let _c = server
+            .mock("GET", "/futures/v1/contracts")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"results":[
+                {"ticker":"NGF7-NGF8","active":true},
+                {"ticker":"NGZ26","active":true,"last_trade_date":"2026-11-25"},
+                {"ticker":"NGX26","active":true,"last_trade_date":"2026-10-28"}
+            ]}"#,
+            )
+            .create();
+        let _x = server
+            .mock("GET", "/futures/v1/aggs/NGX26")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(day_bar(10.0))
+            .create();
+        let _z = server
+            .mock("GET", "/futures/v1/aggs/NGZ26")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .create();
+        let adapter = MassiveAdapter::with_base_url("token", server.url());
+        let kurve = adapter.terminkurve("NG", 1_791_028_800, 2).unwrap();
+        assert_eq!(kurve.len(), 2);
+        assert_eq!(kurve[0].ticker, "NGX26");
+        assert_eq!(kurve[0].last_trade_date, "2026-10-28");
+        assert_eq!(kurve[0].close, Some(1.5));
+        assert_eq!(kurve[1].ticker, "NGZ26");
+        assert_eq!(
+            kurve[1].close, None,
+            "ein fehlender Schluss verwirft die Kurve nicht"
+        );
     }
 
     /// Spreads und Butterflies dürfen nie als Frontmonat herauskommen — sie
