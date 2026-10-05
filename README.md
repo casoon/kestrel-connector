@@ -14,7 +14,7 @@ into the core library.
 |---|---|---|
 | `eodhd` | `eodhd` | implemented (EOD, intraday, delayed real-time poll) |
 | `capitalcom` | `capitalcom` | implemented (session login, historical prices w/ pagination, latest-bar poll) |
-| `massive` | `massive` | implemented (exchange volume from futures, front-month roll by volume; needs a futures entitlement) |
+| `massive` | `massive` | implemented (exchange volume from futures: continuous series per product by a fixed roll rule — previous session's volume, never back to an earlier expiry — plus raw single-contract bars; needs a futures entitlement) |
 | `ib` | `ib` | scaffold only, not implemented (deferred — needs a running TWS/Gateway process, see plan/status.md) |
 
 ## Usage

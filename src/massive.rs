@@ -34,7 +34,7 @@
 //!   sind hier unbrauchbar und werden verworfen.
 //! - Ohne `date=` liefert die Kontraktliste historische Zeilen ab 2017.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use kestrel_chartkit::{Bar, DataFeedAdapter, Timeframe};
 use serde::Deserialize;
@@ -55,13 +55,34 @@ const FRONT_MONTH_TTL_SECS: i64 = 3600;
 /// Volumen.
 const CONTRACT_PAGE_LIMIT: usize = 250;
 
-/// Wie viele Seiten die Auflistung höchstens liest. Bei Erdgas lagen die
-/// ersten beiden voller Spreads; drei Seiten sind Reserve, keine Erwartung.
-const MAX_CONTRACT_PAGES: usize = 4;
+/// So viele Seiten liest eine Kontraktliste höchstens. Die Liste ist
+/// alphabetisch: bei Erdgas stehen die Frontmonate (`NGV26`, `NGX26`) erst
+/// auf der dritten Seite, hinter Spreads und den Januar-Kontrakten ferner
+/// Jahre (`NGF27`). Wer früher aufhört, wählt unter den Kontrakten, die er
+/// zufällig gesehen hat — und fand so bis 2026-10 den falschen.
+const LISTING_PAGES: usize = 12;
 
-/// So viele Seiten liest die Terminkurve höchstens — bei Erdgas reichen
-/// Einzelkontrakte über Jahre, verteilt über mehrere Seiten.
-const TERMINKURVE_SEITEN: usize = 12;
+/// Wie viele frühere Tage eine Kontraktliste nachgeschlagen wird, wenn sie
+/// für den gefragten Tag noch leer ist. Kurz nach UTC-Mitternacht ist sie
+/// es: der Collector meldete jede Nacht zwischen 00 und 04 Uhr „keinen
+/// aktiven Einzelkontrakt".
+const LISTING_FALLBACK_DAYS: i64 = 3;
+
+/// Spanne einer Abfrage in Tagen, wenn der Bereich größer ist. Eine Seite
+/// fasst 50 000 Bars; ein Kontrakt hat auf 15m knapp 100 am Tag.
+const CHUNK_DAYS: i64 = 180;
+
+/// Wie viele nächstfällige Kontrakte je Stichtag als Kandidaten der
+/// fortlaufenden Reihe gelten.
+const ROLL_CANDIDATES: usize = 6;
+
+/// Abstand der Stichtage, an denen die Kontraktliste für eine fortlaufende
+/// Reihe gelesen wird. Ein Kontrakt trägt etwa einen Monat lang Volumen.
+const ROLL_SAMPLE_DAYS: i64 = 28;
+
+/// Vorlauf vor dem gefragten Bereich, damit der erste Tag einen Vortag
+/// hat, an dessen Volumen die Wahl hängt.
+const ROLL_LEAD_DAYS: i64 = 10;
 
 /// Wie viele der nächstfälligen Kontrakte auf Volumen geprüft werden. Der
 /// liquideste liegt immer unter den vordersten; alles dahinter kostete nur
@@ -115,16 +136,11 @@ impl MassiveAdapter {
             }
         }
 
+        // Ein leeres Ergebnis ist ein Fehler, kein „keine Bars": der
+        // Aufrufer läse es sonst als Datenlücke, dabei ist die Auflösung
+        // gescheitert.
         let day = format_date(now);
-        let mut candidates = self.list_outrights(product, &day)?;
-        if candidates.is_empty() {
-            // Kein leeres Ergebnis zurückgeben: der Aufrufer könnte es als
-            // "keine Bars" lesen, dabei ist die Auflösung gescheitert.
-            return Err(format!(
-                "Massive führt für '{product}' am {day} keinen aktiven Einzelkontrakt \
-                 (die Liste enthält nur Spreads, oder der Produktcode stimmt nicht)"
-            ));
-        }
+        let (_, mut candidates) = self.outrights_near(product, now)?;
 
         // Erst nach Verfall eingrenzen, dann nach Volumen entscheiden.
         //
@@ -140,7 +156,7 @@ impl MassiveAdapter {
 
         let mut best: Option<(String, f64)> = None;
         for contract in &candidates {
-            let volume = self.recent_volume(&contract.ticker).unwrap_or(0.0);
+            let volume = self.volume_before(&contract.ticker, &day).unwrap_or(0.0);
             if best.as_ref().is_none_or(|(_, seen)| volume > *seen) {
                 best = Some((contract.ticker.clone(), volume));
             }
@@ -172,8 +188,7 @@ impl MassiveAdapter {
         // Nach der ersten Seite mit Einzelkontrakten aufzuhören (wie
         // `list_outrights`) ergäbe hier Januar/Februar statt der vordersten
         // Fälligkeiten.
-        let mut vertraege =
-            self.list_outrights_pages(product, &format_date(now), TERMINKURVE_SEITEN)?;
+        let mut vertraege = self.list_outrights(product, &format_date(now))?;
         vertraege.sort_by(|a, b| a.last_trade_date.cmp(&b.last_trade_date));
         vertraege.truncate(n);
         let mut out = Vec::with_capacity(vertraege.len());
@@ -195,27 +210,16 @@ impl MassiveAdapter {
 
     /// Alle aktiven Einzelkontrakte eines Produkts an einem Tag.
     ///
-    /// Muss blättern. Die Liste ist alphabetisch, und `NG:BF …` sowie
-    /// `NGF7-NGF8` sortieren vor `NGV26` — bei Erdgas stand auf den ersten
-    /// beiden Seiten zu je 250 Einträgen kein einziger Einzelkontrakt. Wer
-    /// nur die erste Seite liest, bekommt eine leere Auswahl und hält sie
-    /// für "gibt es nicht".
+    /// Liest die **ganze** Liste (bis [`LISTING_PAGES`]). Sie ist
+    /// alphabetisch, und `NG:BF …` sowie `NGF7-NGF8` sortieren vor `NGV26` —
+    /// bei Erdgas stand auf den ersten beiden Seiten zu je 250 Einträgen kein
+    /// einziger Einzelkontrakt, auf der dritten zuerst die fernen
+    /// Januar-Kontrakte. Nach den ersten Einzelkontrakten aufzuhören ergab
+    /// eine leere Auswahl oder den falschen Frontmonat.
     fn list_outrights(&self, product: &str, day: &str) -> Result<Vec<ContractRow>, String> {
-        self.list_outrights_pages(product, day, 0)
-    }
-
-    /// Wie [`Self::list_outrights`]; mit `min_seiten > 0` blättert es
-    /// mindestens so viele Seiten (bis zum Ende der Liste), statt nach den
-    /// ersten Einzelkontrakten aufzuhören.
-    fn list_outrights_pages(
-        &self,
-        product: &str,
-        day: &str,
-        min_seiten: usize,
-    ) -> Result<Vec<ContractRow>, String> {
         let mut out: Vec<ContractRow> = Vec::new();
         let mut next: Option<String> = None;
-        for seite in 0..MAX_CONTRACT_PAGES.max(min_seiten) {
+        for _ in 0..LISTING_PAGES {
             let listing: ContractListing = match &next {
                 None => ureq::get(&format!("{}/futures/v1/contracts", self.base_url))
                     .query("product_code", product)
@@ -237,23 +241,47 @@ impl MassiveAdapter {
                     .into_iter()
                     .filter(|c| c.active && is_outright(&c.ticker)),
             );
-            // Weiterblättern, bis Einzelkontrakte da sind — danach nicht mehr:
-            // die restlichen Seiten tragen nur fernere Fälligkeiten.
-            if empty || (!out.is_empty() && seite + 1 >= min_seiten) {
-                break;
-            }
             match listing.next_url {
-                Some(url) => next = Some(url),
-                None => break,
+                Some(url) if !empty => next = Some(url),
+                _ => break,
             }
         }
         Ok(out)
     }
 
-    /// Volumen der jüngsten Tagesbar — das Maß, an dem der Frontmonat hängt.
-    fn recent_volume(&self, ticker: &str) -> Result<f64, String> {
-        let bars = self.fetch_aggs(ticker, "1day", None, None, 1)?;
-        Ok(bars.first().map(|b| b.volume).unwrap_or(0.0))
+    /// Die Einzelkontrakte für den Tag von `now`, bei leerer Liste für einen
+    /// der letzten [`LISTING_FALLBACK_DAYS`] Tage davor. Gibt den Tag mit
+    /// zurück, für den die Liste tatsächlich galt.
+    fn outrights_near(
+        &self,
+        product: &str,
+        now: i64,
+    ) -> Result<(String, Vec<ContractRow>), String> {
+        for back in 0..=LISTING_FALLBACK_DAYS {
+            let day = format_date(now - back * 86_400);
+            let rows = self.list_outrights(product, &day)?;
+            if !rows.is_empty() {
+                return Ok((day, rows));
+            }
+        }
+        Err(format!(
+            "Massive führt für '{product}' am {} keinen aktiven Einzelkontrakt \
+             (die Liste enthält nur Spreads, oder der Produktcode stimmt nicht)",
+            format_date(now)
+        ))
+    }
+
+    /// Volumen der jüngsten **abgeschlossenen** Handelssitzung vor `day` —
+    /// das Maß, an dem der Frontmonat hängt. Die laufende Sitzung zählt
+    /// nicht: kurz nach Mitternacht ist sie erst wenige Minuten alt, und ein
+    /// Kontrakt, der gerade erst eröffnet hat, wirkte dann wie der
+    /// schwächste.
+    fn volume_before(&self, ticker: &str, day: &str) -> Result<f64, String> {
+        let mut rows = self.fetch_rows(ticker, "1day", None, None, 5)?;
+        rows.sort_by_key(|r| r.window_start);
+        let closed = rows.iter().rev().find(|r| r.day().as_str() < day);
+        // Ohne Sitzungsangabe (oder ohne Vortag) bleibt die jüngste Bar.
+        Ok(closed.or(rows.last()).map(|r| r.volume).unwrap_or(0.0))
     }
 
     /// Roher Aggregat-Abruf. `from`/`to` in Sekunden, exklusiv oben.
@@ -265,6 +293,22 @@ impl MassiveAdapter {
         to: Option<i64>,
         limit: usize,
     ) -> Result<Vec<Bar>, String> {
+        Ok(self
+            .fetch_rows(ticker, resolution, from, to, limit)?
+            .iter()
+            .map(AggRow::bar)
+            .collect())
+    }
+
+    /// Wie [`Self::fetch_aggs`], aber mit der Sitzung jeder Bar, aufsteigend.
+    fn fetch_rows(
+        &self,
+        ticker: &str,
+        resolution: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<AggRow>, String> {
         let url = format!("{}/futures/v1/aggs/{ticker}", self.base_url);
         let mut req = ureq::get(&url)
             .query("resolution", resolution)
@@ -276,36 +320,201 @@ impl MassiveAdapter {
         if let Some(to) = to {
             req = req.query("window_start.lt", nanos(to).to_string().as_str());
         }
-        let page: AggPage = req
+        let mut page: AggPage = req
             .call()
             .map_err(|e| format!("Massive-Aggregate für '{ticker}' fehlgeschlagen: {e}"))?
             .body_mut()
             .read_json()
             .map_err(|e| format!("Massive-Aggregate für '{ticker}' unlesbar: {e}"))?;
-
-        let mut bars: Vec<Bar> = page
-            .results
-            .into_iter()
-            .map(|r| Bar {
-                // Nanosekunden -> Sekunden, siehe Modulkopf.
-                timestamp: r.window_start / 1_000_000_000,
-                open: r.open,
-                high: r.high,
-                low: r.low,
-                close: r.close,
-                volume: r.volume,
-            })
-            .collect();
         // Selbst sortieren: `order=asc` wird ignoriert.
+        page.results.sort_by_key(|r| r.window_start);
+        Ok(page.results)
+    }
+
+    /// Alle Bars eines Bereichs in Abschnitten von [`CHUNK_DAYS`] —
+    /// eine Seite fasst 50 000, zwei Jahre 15m eines langen Kontrakts auch.
+    fn fetch_rows_range(
+        &self,
+        ticker: &str,
+        resolution: &str,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<AggRow>, String> {
+        let mut out: Vec<AggRow> = Vec::new();
+        let mut start = from;
+        while start < to {
+            let end = (start + CHUNK_DAYS * 86_400).min(to);
+            out.extend(self.fetch_rows(ticker, resolution, Some(start), Some(end), 50_000)?);
+            start = end;
+        }
+        Ok(out)
+    }
+
+    /// Die Bars **eines** Einzelkontrakts (`NGX26`, nicht `NG`) für
+    /// `[from, to)` in Sekunden, aufsteigend. Rohdaten, ohne Rollregel — die
+    /// Grundlage, aus der sich jede fortlaufende Reihe neu bauen lässt.
+    pub fn contract_bars(
+        &self,
+        ticker: &str,
+        timeframe: Timeframe,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<Bar>, String> {
+        let resolution = resolution_of(timeframe)?;
+        Ok(self
+            .fetch_rows_range(ticker, resolution, from, to)?
+            .iter()
+            .map(AggRow::bar)
+            .collect())
+    }
+
+    /// Fortlaufende Reihe eines Produkts (`NG`) für `[from, to)`: je
+    /// Handelssitzung die Bars des Kontrakts, den [`roll_schedule`] wählt.
+    ///
+    /// Statt eines einzigen Kontrakts für den ganzen Bereich — das ergab für
+    /// die Vergangenheit einen Kontrakt, der damals noch gar nicht liquide
+    /// war (Natural Gas: Monatsmittel 4 → 425 Kontrakte je Stunde, der
+    /// Lebenslauf eines Kontrakts).
+    pub fn continuous(
+        &self,
+        product: &str,
+        timeframe: Timeframe,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<Bar>, String> {
+        let resolution = resolution_of(timeframe)?;
+
+        // Kandidaten: die nächstfälligen Kontrakte an Stichtagen über den
+        // Bereich. Eine Liste an einem Tag kennt nur, was dann aktiv ist.
+        let mut by_ticker: BTreeMap<String, String> = BTreeMap::new();
+        let mut sample = from;
+        loop {
+            let at = sample.min(to);
+            if let Ok((day, mut rows)) = self.outrights_near(product, at) {
+                rows.retain(|c| c.last_trade_date.as_str() >= day.as_str());
+                rows.sort_by(|a, b| a.last_trade_date.cmp(&b.last_trade_date));
+                for c in rows.into_iter().take(ROLL_CANDIDATES) {
+                    by_ticker.insert(c.ticker, c.last_trade_date);
+                }
+            }
+            if at >= to {
+                break;
+            }
+            sample += ROLL_SAMPLE_DAYS * 86_400;
+        }
+        if by_ticker.is_empty() {
+            return Err(format!(
+                "Massive führt für '{product}' im Bereich {} … {} keinen aktiven \
+                 Einzelkontrakt (die Liste enthält nur Spreads, oder der Produktcode \
+                 stimmt nicht)",
+                format_date(from),
+                format_date(to)
+            ));
+        }
+        let mut contracts: Vec<(String, String)> = by_ticker.into_iter().collect();
+        contracts.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        // Tagesvolumen je Kontrakt, mit Vorlauf für den Vortag des ersten Tages.
+        let lead_from = from - ROLL_LEAD_DAYS * 86_400;
+        let mut volumes: Vec<BTreeMap<String, f64>> = Vec::with_capacity(contracts.len());
+        for (ticker, _) in &contracts {
+            let rows = self.fetch_rows_range(ticker, "1day", lead_from, to)?;
+            volumes.push(rows.iter().map(|r| (r.day(), r.volume)).collect());
+        }
+        let mut sessions: Vec<String> = volumes
+            .iter()
+            .flat_map(|v| v.keys().cloned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        sessions.sort();
+        let expiries: Vec<String> = contracts.iter().map(|(_, e)| e.clone()).collect();
+        let schedule = roll_schedule(&expiries, &volumes, &sessions);
+
+        let mut bars: Vec<Bar> = Vec::new();
+        for (idx, (ticker, _)) in contracts.iter().enumerate() {
+            let days: std::collections::BTreeSet<&String> = schedule
+                .iter()
+                .filter(|(_, k)| **k == idx)
+                .map(|(d, _)| d)
+                .collect();
+            if days.is_empty() {
+                continue;
+            }
+            for row in self.fetch_rows_range(ticker, resolution, from, to)? {
+                if days.contains(&row.day()) {
+                    bars.push(row.bar());
+                }
+            }
+        }
         bars.sort_by_key(|b| b.timestamp);
+        bars.dedup_by_key(|b| b.timestamp);
         Ok(bars)
     }
+}
+
+/// Welcher Kontrakt an welcher Handelssitzung gilt — die **Rollregel v1**.
+///
+/// - Maßgeblich ist das Volumen der **vorangegangenen** Sitzung. Das von
+///   heute zu nehmen hieße, am Morgen zu wissen, wohin die Liquidität am
+///   Abend wandert: im Backtest ein Blick in die Zukunft.
+/// - Unter den noch handelbaren Kontrakten (`Verfall >= Tag`) gewinnt das
+///   höchste Volumen; bei Gleichstand der nähere Verfall.
+/// - Ein Rollen zurück zu einem früheren Verfall gibt es nicht, solange der
+///   zuletzt gewählte Kontrakt noch handelbar ist — gegen Hin- und Herspringen
+///   um den Rolltermin.
+/// - Ohne Vortag (erste Sitzung) gilt der nächstfällige.
+///
+/// `expiries` ist aufsteigend sortiert (`YYYY-MM-DD`), `volumes[k]` das
+/// Tagesvolumen des Kontrakts `k` je Sitzungstag, `sessions` aufsteigend.
+pub(crate) fn roll_schedule(
+    expiries: &[String],
+    volumes: &[BTreeMap<String, f64>],
+    sessions: &[String],
+) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    let mut last: Option<usize> = None;
+    for (i, day) in sessions.iter().enumerate() {
+        let alive: Vec<usize> = (0..expiries.len())
+            .filter(|&k| expiries[k].as_str() >= day.as_str())
+            .collect();
+        let Some(&first) = alive.first() else {
+            continue;
+        };
+        let mut best = first;
+        if i > 0 {
+            let prev = &sessions[i - 1];
+            let volume = |k: usize| volumes[k].get(prev).copied().unwrap_or(0.0);
+            let mut best_volume = volume(best);
+            for &k in &alive[1..] {
+                if volume(k) > best_volume {
+                    best = k;
+                    best_volume = volume(k);
+                }
+            }
+        }
+        if let Some(l) = last {
+            if l > best && expiries[l].as_str() >= day.as_str() {
+                best = l;
+            }
+        }
+        last = Some(best);
+        out.insert(day.clone(), best);
+    }
+    out
 }
 
 /// Einzelkontrakte tragen weder `:` (Butterfly `NG:BF F7-G7-H7`) noch `-`
 /// (Kalenderspread `NGF7-NGF8`).
 fn is_outright(ticker: &str) -> bool {
     !ticker.contains(':') && !ticker.contains('-')
+}
+
+fn wall_clock() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn nanos(seconds: i64) -> i128 {
@@ -344,9 +553,7 @@ impl DataFeedAdapter for MassiveAdapter {
         from: i64,
         to: i64,
     ) -> Result<Vec<Bar>, Self::Error> {
-        let resolution = resolution_of(timeframe)?;
-        let ticker = self.front_month(symbol, to)?;
-        self.fetch_aggs(&ticker, resolution, Some(from), Some(to), 50_000)
+        self.continuous(symbol, timeframe, from, to)
     }
 
     fn subscribe_live(&mut self, symbol: &str, timeframe: Timeframe) -> Result<(), Self::Error> {
@@ -370,16 +577,10 @@ impl DataFeedAdapter for MassiveAdapter {
         let mut out = Vec::new();
         for (symbol, timeframe) in subs {
             let resolution = resolution_of(timeframe)?;
-            // `poll_live` hat keine Uhr im Trait. Der zuletzt gesehene
-            // Zeitstempel ist die beste verfügbare Näherung für "jetzt" und
-            // reicht für die Frontmonat-Frist; beim ersten Aufruf löst sie
-            // ohnehin auf.
-            let now = self
-                .live_cursor
-                .get(&symbol)
-                .copied()
-                .unwrap_or(i64::MIN)
-                .max(0);
+            // Die Uhr, nicht der zuletzt gesehene Zeitstempel: beim ersten
+            // Aufruf war der 0, und die Kontraktliste wurde für den
+            // 1970-01-01 gelesen.
+            let now = wall_clock();
             let ticker = self.front_month(&symbol, now)?;
             let bars = self.fetch_aggs(&ticker, resolution, None, None, 10)?;
             let cursor = self.live_cursor.entry(symbol).or_insert(i64::MIN);
@@ -434,6 +635,31 @@ struct AggRow {
     close: f64,
     #[serde(default)]
     volume: f64,
+    /// Handelssitzung, zu der die Bar gehört (`YYYY-MM-DD`). Eine CME-
+    /// Sitzung beginnt am Vorabend; der UTC-Tag der Bar trennt sie falsch.
+    #[serde(default)]
+    session_end_date: Option<String>,
+}
+
+impl AggRow {
+    /// Die Sitzung; ohne Angabe der UTC-Tag der Bar.
+    fn day(&self) -> String {
+        self.session_end_date
+            .clone()
+            .unwrap_or_else(|| format_date(self.window_start / 1_000_000_000))
+    }
+
+    fn bar(&self) -> Bar {
+        Bar {
+            // Nanosekunden -> Sekunden, siehe Modulkopf.
+            timestamp: self.window_start / 1_000_000_000,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            volume: self.volume,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -560,7 +786,7 @@ mod tests {
     }
 
     /// Die Antwort kommt absteigend, auch wenn `order=asc` gesetzt ist.
-    /// Jeder Konsument erwartet aufsteigend.
+    /// Jeder Konsument erwartet aufsteigend — und Sekunden statt Nanosekunden.
     #[test]
     fn bars_come_back_ascending_and_in_seconds() {
         let mut server = mockito::Server::new();
@@ -568,25 +794,25 @@ mod tests {
             .mock("GET", "/futures/v1/contracts")
             .match_query(mockito::Matcher::Any)
             .with_status(200)
-            .with_body(contracts_body())
+            .with_body(
+                r#"{"results":[{"ticker":"NGV26","active":true,"last_trade_date":"2026-12-29"}]}"#,
+            )
             .create();
-        let _v = server
+        let _d = server
             .mock("GET", "/futures/v1/aggs/NGV26")
-            .match_query(mockito::Matcher::Any)
+            .match_query(mockito::Matcher::UrlEncoded(
+                "resolution".into(),
+                "1day".into(),
+            ))
             .with_status(200)
             .with_body(day_bar(900.0))
-            .expect_at_least(1)
-            .create();
-        let _x = server
-            .mock("GET", "/futures/v1/aggs/NGX26")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(day_bar(1.0))
-            .expect_at_least(1)
             .create();
         let _h = server
             .mock("GET", "/futures/v1/aggs/NGV26")
-            .match_query(mockito::Matcher::Any)
+            .match_query(mockito::Matcher::UrlEncoded(
+                "resolution".into(),
+                "1hour".into(),
+            ))
             .with_status(200)
             .with_body(
                 r#"{"results":[
@@ -609,6 +835,156 @@ mod tests {
         // Sekunden, nicht Nanosekunden: 1788652800 ist 2026, 1.79e18 wäre es nicht.
         assert_eq!(bars[0].timestamp, 1_788_652_800);
         assert_eq!(bars[0].volume, 10.0);
+    }
+
+    fn sessions(days: &[&str]) -> Vec<String> {
+        days.iter().map(|d| d.to_string()).collect()
+    }
+
+    fn volumes(rows: &[&[(&str, f64)]]) -> Vec<BTreeMap<String, f64>> {
+        rows.iter()
+            .map(|r| r.iter().map(|(d, v)| (d.to_string(), *v)).collect())
+            .collect()
+    }
+
+    /// Das Volumen von **heute** darf die Wahl von heute nicht bestimmen:
+    /// `B` überholt `A` am 03., gewählt wird `B` aber erst am 04. — am 03.
+    /// hätte der Backtest sonst am Morgen gewusst, was am Abend geschieht.
+    #[test]
+    fn roll_follows_yesterdays_volume_not_todays() {
+        let expiries = sessions(&["2026-10-28", "2026-11-25"]);
+        let v = volumes(&[
+            &[
+                ("2026-10-01", 90.0),
+                ("2026-10-02", 80.0),
+                ("2026-10-03", 40.0),
+            ],
+            &[
+                ("2026-10-01", 10.0),
+                ("2026-10-02", 20.0),
+                ("2026-10-03", 90.0),
+            ],
+        ]);
+        let days = sessions(&["2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04"]);
+        let plan = roll_schedule(&expiries, &v, &days);
+        assert_eq!(plan["2026-10-02"], 0);
+        assert_eq!(plan["2026-10-03"], 0, "B ist erst am 03. größer");
+        assert_eq!(plan["2026-10-04"], 1);
+    }
+
+    /// Nach einem Rollen springt die Reihe nicht zurück, wenn der frühere
+    /// Kontrakt kurz wieder mehr Volumen trägt.
+    #[test]
+    fn roll_never_goes_back_to_an_earlier_expiry() {
+        let expiries = sessions(&["2026-10-28", "2026-11-25"]);
+        let v = volumes(&[
+            &[
+                ("2026-10-01", 90.0),
+                ("2026-10-02", 10.0),
+                ("2026-10-03", 95.0),
+            ],
+            &[
+                ("2026-10-01", 10.0),
+                ("2026-10-02", 90.0),
+                ("2026-10-03", 20.0),
+            ],
+        ]);
+        let days = sessions(&["2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04"]);
+        let plan = roll_schedule(&expiries, &v, &days);
+        assert_eq!(plan["2026-10-03"], 1);
+        assert_eq!(plan["2026-10-04"], 1, "kein Zurückspringen");
+    }
+
+    /// Ein abgelaufener Kontrakt kommt nicht mehr in Frage, auch wenn sein
+    /// Volumen am Vortag das größte war.
+    #[test]
+    fn roll_skips_expired_contracts() {
+        let expiries = sessions(&["2026-10-02", "2026-11-25"]);
+        let v = volumes(&[&[("2026-10-02", 500.0)], &[("2026-10-02", 10.0)]]);
+        let days = sessions(&["2026-10-02", "2026-10-05"]);
+        let plan = roll_schedule(&expiries, &v, &days);
+        assert_eq!(plan["2026-10-05"], 1);
+    }
+
+    /// Der Frontmonat steht auf der **dritten** Seite der alphabetischen
+    /// Liste, hinter Spreads und dem Januar-Kontrakt ferner Jahre. Wer nach
+    /// der ersten Seite mit Einzelkontrakten aufhört, wählt `NGF27` — das
+    /// war der Fehler, der monatelang das Volumen eines Kontrakts mit einem
+    /// Zehntel des Umsatzes lieferte.
+    #[test]
+    fn front_month_is_found_beyond_the_first_page_with_outrights() {
+        let mut server = mockito::Server::new();
+        let _c = server
+            .mock("GET", "/futures/v1/contracts")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"results":[
+                    {{"ticker":"NGF7-NGF8","active":true}},
+                    {{"ticker":"NGF27","active":true,"last_trade_date":"2026-12-29"}}
+                ],"next_url":"{}/seite2"}}"#,
+                server.url()
+            ))
+            .create();
+        let _s2 = server
+            .mock("GET", "/seite2")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"results":[
+                    {"ticker":"NGV26","active":false,"last_trade_date":"2026-09-28"},
+                    {"ticker":"NGX26","active":true,"last_trade_date":"2026-10-28"},
+                    {"ticker":"NGZ26","active":true,"last_trade_date":"2026-11-25"}
+                ]}"#,
+            )
+            .create();
+        for (ticker, volume) in [("NGF27", 5.0), ("NGX26", 900.0), ("NGZ26", 200.0)] {
+            server
+                .mock("GET", format!("/futures/v1/aggs/{ticker}").as_str())
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(day_bar(volume))
+                .create();
+        }
+        let mut adapter = MassiveAdapter::with_base_url("token", server.url());
+        assert_eq!(adapter.front_month("NG", 1_788_652_800).unwrap(), "NGX26");
+    }
+
+    /// Kurz nach Mitternacht UTC ist die Kontraktliste für den neuen Tag
+    /// noch leer; der Vortag trägt sie. Ohne den Rückgriff meldete der
+    /// Collector jede Nacht „keinen aktiven Einzelkontrakt".
+    #[test]
+    fn an_empty_listing_for_today_falls_back_to_yesterday() {
+        let mut server = mockito::Server::new();
+        // 2026-09-06 (Tag von 1_788_652_800) leer, 2026-09-05 gefüllt.
+        let _leer = server
+            .mock("GET", "/futures/v1/contracts")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "date".into(),
+                "2026-09-06".into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"results":[]}"#)
+            .create();
+        let _voll = server
+            .mock("GET", "/futures/v1/contracts")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "date".into(),
+                "2026-09-05".into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"ticker":"NGX26","active":true,"last_trade_date":"2026-10-28"}]}"#,
+            )
+            .create();
+        let _a = server
+            .mock("GET", "/futures/v1/aggs/NGX26")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(day_bar(100.0))
+            .create();
+        let mut adapter = MassiveAdapter::with_base_url("token", server.url());
+        assert_eq!(adapter.front_month("NG", 1_788_652_800).unwrap(), "NGX26");
     }
 
     /// Gegen die echte Schnittstelle. Läuft nur mit `MASSIVE_API_KEY` und
@@ -648,7 +1024,8 @@ mod tests {
         );
         // Sekunden, nicht Nanosekunden: alles über 10^12 wäre die falsche Einheit.
         assert!(
-            bars.iter().all(|b| b.timestamp > 1_500_000_000 && b.timestamp < 10_000_000_000),
+            bars.iter()
+                .all(|b| b.timestamp > 1_500_000_000 && b.timestamp < 10_000_000_000),
             "Zeitstempel nicht in Sekunden"
         );
         // Der ganze Zweck des Adapters: jede Bar trägt Volumen.
