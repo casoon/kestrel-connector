@@ -333,6 +333,14 @@ impl MassiveAdapter {
 
     /// Alle Bars eines Bereichs in Abschnitten von [`CHUNK_DAYS`] —
     /// eine Seite fasst 50 000, zwei Jahre 15m eines langen Kontrakts auch.
+    ///
+    /// **Die Fenster beginnen auf einer UTC-Tagesgrenze.** Massive legt die
+    /// Eimer der Aggregate relativ zum Anfang des Abfragefensters, nicht zur
+    /// Uhr: ein Fenster ab `13:15:01` lieferte 15-Minuten-Bars um `:00:01`
+    /// versetzt, ein Abschnitt ab einer krummen Sekunde ganze Monate um fünf
+    /// bis sechs Minuten daneben — nebeneinander mit den richtigen, also
+    /// doppelt und nirgends passend zu den Bars des Brokers. Was vor `from`
+    /// liegt, wird danach verworfen.
     fn fetch_rows_range(
         &self,
         ticker: &str,
@@ -341,12 +349,13 @@ impl MassiveAdapter {
         to: i64,
     ) -> Result<Vec<AggRow>, String> {
         let mut out: Vec<AggRow> = Vec::new();
-        let mut start = from;
+        let mut start = from.div_euclid(86_400) * 86_400;
         while start < to {
             let end = (start + CHUNK_DAYS * 86_400).min(to);
             out.extend(self.fetch_rows(ticker, resolution, Some(start), Some(end), 50_000)?);
             start = end;
         }
+        out.retain(|r| r.window_start / 1_000_000_000 >= from);
         Ok(out)
     }
 
@@ -985,6 +994,39 @@ mod tests {
             .create();
         let mut adapter = MassiveAdapter::with_base_url("token", server.url());
         assert_eq!(adapter.front_month("NG", 1_788_652_800).unwrap(), "NGX26");
+    }
+
+    /// Das Fenster einer Abfrage beginnt auf einer UTC-Tagesgrenze, auch wenn
+    /// der Aufrufer mitten am Tag anfragt — sonst legt Massive die Eimer
+    /// relativ zum krummen Anfang. Was vor dem gewünschten Beginn liegt, wird
+    /// verworfen.
+    #[test]
+    fn windows_start_on_a_day_boundary_and_earlier_bars_are_dropped() {
+        let mut server = mockito::Server::new();
+        // 2026-09-06 00:00:00 UTC = 1_788_652_800; gefragt wird ab 13:15:01.
+        let from = 1_788_652_800 + 13 * 3600 + 15 * 60 + 1;
+        let _a = server
+            .mock("GET", "/futures/v1/aggs/NGX26")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "window_start.gte".into(),
+                "1788652800000000000".into(),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"results":[
+                    {{"window_start":{},"open":1,"high":2,"low":0.5,"close":1.5,"volume":1}},
+                    {{"window_start":{},"open":1,"high":2,"low":0.5,"close":1.5,"volume":2}}
+                ]}}"#,
+                (from - 3600) * 1_000_000_000,
+                (from + 899) * 1_000_000_000
+            ))
+            .create();
+        let adapter = MassiveAdapter::with_base_url("token", server.url());
+        let bars = adapter
+            .contract_bars("NGX26", Timeframe::Minute(15), from, from + 86_400)
+            .unwrap();
+        assert_eq!(bars.len(), 1, "die Bar vor dem Beginn fällt weg");
+        assert_eq!(bars[0].volume, 2.0);
     }
 
     /// Gegen die echte Schnittstelle. Läuft nur mit `MASSIVE_API_KEY` und
