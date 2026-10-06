@@ -56,10 +56,12 @@ const FRONT_MONTH_TTL_SECS: i64 = 3600;
 const CONTRACT_PAGE_LIMIT: usize = 250;
 
 /// So viele Seiten liest eine Kontraktliste höchstens. Die Liste ist
-/// alphabetisch: bei Erdgas stehen die Frontmonate (`NGV26`, `NGX26`) erst
-/// auf der dritten Seite, hinter Spreads und den Januar-Kontrakten ferner
-/// Jahre (`NGF27`). Wer früher aufhört, wählt unter den Kontrakten, die er
-/// zufällig gesehen hat — und fand so bis 2026-10 den falschen.
+/// alphabetisch: ohne `type=single` standen bei Erdgas die Frontmonate
+/// (`NGV26`, `NGX26`) erst auf der dritten Seite, hinter Spreads und den
+/// Januar-Kontrakten ferner Jahre (`NGF27`); bei Brent waren es 22 Seiten,
+/// und die zwölfte endete bei `BZN…` — Frontmonat `BZZ6` nie gesehen
+/// (2026-10-06). Mit `type=single` passt jedes Produkt auf eine Seite
+/// (Brent 101, Erdgas 146 Einträge); die Grenze bleibt als Schutz.
 const LISTING_PAGES: usize = 12;
 
 /// Wie viele frühere Tage eine Kontraktliste nachgeschlagen wird, wenn sie
@@ -224,6 +226,9 @@ impl MassiveAdapter {
                 None => ureq::get(&format!("{}/futures/v1/contracts", self.base_url))
                     .query("product_code", product)
                     .query("date", day)
+                    // Nur Einzelkontrakte: Spreads und Kombinationen füllten
+                    // sonst die Seiten vor den Frontmonaten.
+                    .query("type", "single")
                     .query("limit", CONTRACT_PAGE_LIMIT.to_string().as_str())
                     .query("apiKey", self.api_key.as_str()),
                 Some(url) => ureq::get(url).query("apiKey", self.api_key.as_str()),
@@ -738,9 +743,11 @@ mod tests {
     #[test]
     fn terminkurve_nach_verfall_mit_schluss() {
         let mut server = mockito::Server::new();
+        // Nur Einzelkontrakte anfragen — ohne `type=single` fand Brent seinen
+        // Frontmonat nicht (22 Seiten, gelesen werden 12).
         let _c = server
             .mock("GET", "/futures/v1/contracts")
-            .match_query(mockito::Matcher::Any)
+            .match_query(mockito::Matcher::UrlEncoded("type".into(), "single".into()))
             .with_status(200)
             .with_body(format!(
                 r#"{{"results":[
