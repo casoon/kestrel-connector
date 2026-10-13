@@ -449,15 +449,15 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kestrel-chartkit"
-version = "0.25.0"
-source = "git+https://github.com/casoon/kestrel-chartkit.git?tag=v0.25.0#ca6bf81ecdfbf6bf2797c2e3e2013699974c8d23"
+version = "0.26.0"
+source = "git+https://github.com/casoon/kestrel-chartkit.git?tag=v0.26.0#711c60aecfb5085cc44a63f65e32cce7b5f994be"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "kestrel-connector"
-version = "0.6.16"
+version = "0.6.17"
 dependencies = [
  "kestrel-chartkit",
  "mockito",
