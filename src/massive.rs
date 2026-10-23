@@ -186,6 +186,31 @@ impl MassiveAdapter {
         now: i64,
         n: usize,
     ) -> Result<Vec<TerminKontrakt>, String> {
+        self.terminkurve_bis(product, now, n, None)
+    }
+
+    /// Wie [`Self::terminkurve`], aber für einen vergangenen Tag (`tag` in
+    /// Sekunden, beliebige Uhrzeit): die an diesem Tag aktiven Kontrakte, je
+    /// mit dem Schluss der Handelssitzung dieses Tages oder der letzten
+    /// davor. Zum Nachtragen von Tagen, an denen niemand abgefragt hat.
+    pub fn terminkurve_am(
+        &self,
+        product: &str,
+        tag: i64,
+        n: usize,
+    ) -> Result<Vec<TerminKontrakt>, String> {
+        self.terminkurve_bis(product, tag, n, Some(format_date(tag)))
+    }
+
+    /// `bis`: jüngste zulässige Sitzung (`YYYY-MM-DD`); `None` nimmt die
+    /// jüngste Tagesbar überhaupt.
+    fn terminkurve_bis(
+        &self,
+        product: &str,
+        now: i64,
+        n: usize,
+        bis: Option<String>,
+    ) -> Result<Vec<TerminKontrakt>, String> {
         // Alle Seiten: die Liste ist alphabetisch, `NGF27` steht vor `NGX26`.
         // Nach der ersten Seite mit Einzelkontrakten aufzuhören (wie
         // `list_outrights`) ergäbe hier Januar/Februar statt der vordersten
@@ -193,14 +218,24 @@ impl MassiveAdapter {
         let mut vertraege = self.list_outrights(product, &format_date(now))?;
         vertraege.sort_by(|a, b| a.last_trade_date.cmp(&b.last_trade_date));
         vertraege.truncate(n);
+        // Für einen vergangenen Tag bis zwei Tage danach abfragen: eine
+        // CME-Sitzung beginnt am Vorabend, ihre Bar kann vor dem Tag liegen
+        // und die des Folgetags schon an ihm.
+        let oben = bis.as_ref().map(|_| now + 2 * 86_400);
         let mut out = Vec::with_capacity(vertraege.len());
         for v in vertraege {
             // Zehn Tage zurück: über ein Wochenende mit Feiertag reicht ein
             // kürzeres Fenster nicht.
             let close = self
-                .fetch_aggs(&v.ticker, "1day", Some(now - 10 * 86_400), None, 20)
+                .fetch_rows(&v.ticker, "1day", Some(now - 10 * 86_400), oben, 20)
                 .ok()
-                .and_then(|bars| bars.last().map(|b| b.close));
+                .and_then(|mut rows| {
+                    rows.sort_by_key(|r| r.window_start);
+                    rows.into_iter()
+                        .rev()
+                        .find(|r| bis.as_ref().is_none_or(|b| r.day() <= *b))
+                        .map(|r| r.close)
+                });
             out.push(TerminKontrakt {
                 ticker: v.ticker,
                 last_trade_date: v.last_trade_date,
@@ -794,6 +829,40 @@ mod tests {
             kurve[1].close, None,
             "ein fehlender Schluss verwirft die Kurve nicht"
         );
+    }
+
+    /// Für einen vergangenen Tag zählt der Schluss seiner Sitzung, nicht
+    /// der einer späteren, die die Abfrage mitliefert.
+    #[test]
+    fn terminkurve_am_nimmt_die_sitzung_des_tages() {
+        let mut server = mockito::Server::new();
+        let _c = server
+            .mock("GET", "/futures/v1/contracts")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "date".into(),
+                "2026-10-16".into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"ticker":"CLZ26","active":true,"last_trade_date":"2026-11-19"}]}"#,
+            )
+            .create();
+        let _z = server
+            .mock("GET", "/futures/v1/aggs/CLZ26")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"results":[
+                {"window_start":1792360800000000000,"open":1,"high":1,"low":1,"close":62.0,"session_end_date":"2026-10-19"},
+                {"window_start":1792101600000000000,"open":1,"high":1,"low":1,"close":61.0,"session_end_date":"2026-10-16"},
+                {"window_start":1792015200000000000,"open":1,"high":1,"low":1,"close":60.0,"session_end_date":"2026-10-15"}
+            ]}"#,
+            )
+            .create();
+        let adapter = MassiveAdapter::with_base_url("token", server.url());
+        // 2026-10-16 20:00 UTC
+        let kurve = adapter.terminkurve_am("CL", 1_792_180_800, 1).unwrap();
+        assert_eq!(kurve[0].close, Some(61.0));
     }
 
     /// Spreads und Butterflies dürfen nie als Frontmonat herauskommen — sie

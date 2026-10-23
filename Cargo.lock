@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "kestrel-connector"
-version = "0.6.25"
+version = "0.6.26"
 dependencies = [
  "kestrel-chartkit",
  "mockito",
