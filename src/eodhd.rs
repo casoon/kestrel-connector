@@ -49,7 +49,8 @@ impl EodhdAdapter {
         to: i64,
     ) -> Result<Vec<Bar>, String> {
         let url = format!("{}/api/eod/{symbol}", self.base_url);
-        let bars: Vec<EodBar> = ureq::get(&url)
+        let bars: Vec<EodBar> = crate::http::agent()
+            .get(&url)
             .query("api_token", self.api_key.as_str())
             .query("fmt", "json")
             .query("period", period)
@@ -97,7 +98,8 @@ impl EodhdAdapter {
         to: i64,
     ) -> Result<Vec<Bar>, String> {
         let url = format!("{}/api/intraday/{symbol}", self.base_url);
-        let bars: Vec<IntradayBar> = ureq::get(&url)
+        let bars: Vec<IntradayBar> = crate::http::agent()
+            .get(&url)
             .query("api_token", self.api_key.as_str())
             .query("fmt", "json")
             .query("interval", interval)
@@ -132,7 +134,8 @@ impl EodhdAdapter {
 
     fn fetch_real_time(&self, symbol: &str) -> Result<Bar, String> {
         let url = format!("{}/api/real-time/{symbol}", self.base_url);
-        let quote: RealTimeQuote = ureq::get(&url)
+        let quote: RealTimeQuote = crate::http::agent()
+            .get(&url)
             .query("api_token", self.api_key.as_str())
             .query("fmt", "json")
             .call()

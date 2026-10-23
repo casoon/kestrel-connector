@@ -223,7 +223,8 @@ impl MassiveAdapter {
         let mut next: Option<String> = None;
         for _ in 0..LISTING_PAGES {
             let listing: ContractListing = match &next {
-                None => ureq::get(&format!("{}/futures/v1/contracts", self.base_url))
+                None => crate::http::agent()
+                    .get(&format!("{}/futures/v1/contracts", self.base_url))
                     .query("product_code", product)
                     .query("date", day)
                     // Nur Einzelkontrakte: Spreads und Kombinationen füllten
@@ -231,7 +232,9 @@ impl MassiveAdapter {
                     .query("type", "single")
                     .query("limit", CONTRACT_PAGE_LIMIT.to_string().as_str())
                     .query("apiKey", self.api_key.as_str()),
-                Some(url) => ureq::get(url).query("apiKey", self.api_key.as_str()),
+                Some(url) => crate::http::agent()
+                    .get(url)
+                    .query("apiKey", self.api_key.as_str()),
             }
             .call()
             .map_err(|e| format!("Massive-Kontraktliste für '{product}' fehlgeschlagen: {e}"))?
@@ -315,7 +318,8 @@ impl MassiveAdapter {
         limit: usize,
     ) -> Result<Vec<AggRow>, String> {
         let url = format!("{}/futures/v1/aggs/{ticker}", self.base_url);
-        let mut req = ureq::get(&url)
+        let mut req = crate::http::agent()
+            .get(&url)
             .query("resolution", resolution)
             .query("limit", limit.to_string().as_str())
             .query("apiKey", self.api_key.as_str());

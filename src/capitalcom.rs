@@ -75,7 +75,8 @@ impl CapitalComAdapter {
 
     fn authenticate(&self) -> Result<CapitalSession, String> {
         let url = format!("{}/api/v1/session", self.base_url);
-        let response = ureq::post(&url)
+        let response = crate::http::agent()
+            .post(&url)
             .header("X-CAP-API-KEY", self.api_key.as_str())
             .send_json(&CreateSessionBody {
                 identifier: &self.identifier,
@@ -114,7 +115,8 @@ impl CapitalComAdapter {
         security_token: &str,
     ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let url = format!("{}/api/v1/prices/{symbol}", self.base_url);
-        ureq::get(&url)
+        crate::http::agent()
+            .get(&url)
             .header("X-CAP-API-KEY", self.api_key.as_str())
             .header("CST", cst)
             .header("X-SECURITY-TOKEN", security_token)

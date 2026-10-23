@@ -7,6 +7,9 @@
 #[cfg(any(feature = "eodhd", feature = "capitalcom", feature = "massive"))]
 mod civil_date;
 
+#[cfg(any(feature = "eodhd", feature = "capitalcom", feature = "massive"))]
+mod http;
+
 #[cfg(feature = "eodhd")]
 pub mod eodhd;
 
