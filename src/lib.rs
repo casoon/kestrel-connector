@@ -10,6 +10,8 @@ mod civil_date;
 #[cfg(any(feature = "eodhd", feature = "capitalcom", feature = "massive"))]
 mod http;
 
+pub mod rollregel;
+
 #[cfg(feature = "eodhd")]
 pub mod eodhd;
 
